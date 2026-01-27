@@ -1,0 +1,6 @@
+numpy
+pandas
+cvxpy
+ecos
+osqp
+matplotlib
