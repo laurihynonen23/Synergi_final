@@ -8,28 +8,46 @@ from io_utils import read_prices, make_hourly_price_repeated
 from models import (
     optimize_ev,
     optimize_tank,
+    optimize_tank_softmin,
     check_hourly_constant,
     check_ev_energy,
     check_tank_bounds,
+    baseline_ev_charge_now,
+    baseline_ev_fixed_window,
+    baseline_tank_thermostat,
+    baseline_tank_night_only,
 )
 from scenarios import build_ev_scenarios, build_tank_scenarios
 
 
 DT_HOURS = 0.25
+EPS_EUR = 1e-6
 OPTIMAL_STATUSES = {"optimal", "optimal_inaccurate"}
+FEASIBLE_STATUSES = OPTIMAL_STATUSES | {"simulated"}
 
 
-def _compute_delta(cost_60, cost_15):
+def _compute_delta(cost_60, cost_15, scenario_id=""):
     if np.isnan(cost_60) or np.isnan(cost_15):
         return np.nan, np.nan
     delta = cost_60 - cost_15
+    if np.isfinite(delta) and abs(delta) < EPS_EUR:
+        return 0.0, 0.0
+    if np.isfinite(delta) and delta < -1e-4:
+        print(f"Warning: unexpected negative delta {delta:.6f} for {scenario_id}")
     if abs(cost_60) < 1e-9:
         return delta, np.nan
-    return delta, (delta / cost_60) * 100.0
+    delta_pct = (delta / cost_60) * 100.0
+    if delta == 0.0:
+        delta_pct = 0.0
+    return delta, delta_pct
 
 
 def _is_optimal(status):
     return status in OPTIMAL_STATUSES
+
+
+def _is_feasible(status):
+    return status in FEASIBLE_STATUSES
 
 
 def _warn_if_not_optimal(scenario_id, label, status):
@@ -38,7 +56,7 @@ def _warn_if_not_optimal(scenario_id, label, status):
 
 
 def _row_status(status_15, status_60):
-    if _is_optimal(status_15) and _is_optimal(status_60):
+    if _is_feasible(status_15) and _is_feasible(status_60):
         return "ok"
     return "infeasible"
 
@@ -135,9 +153,12 @@ def run_all(time_index, p15, p60, ev_scenarios, tank_scenarios, tank_params):
             if hourly and not check_hourly_constant(res["P"], times, tol=1e-4):
                 raise ValueError(f"EV hourly constraint failed: {sc['scenario_id']}")
 
-        delta_eur, delta_pct = _compute_delta(res_60["cost"], res_15["cost"])
+        delta_eur, delta_pct = _compute_delta(
+            res_60["cost"], res_15["cost"], scenario_id=sc["scenario_id"]
+        )
         results.append(
             {
+                "method": "OPT",
                 "device": sc["device"],
                 "scenario_id": sc["scenario_id"],
                 "home_window": sc.get("home_window", ""),
@@ -242,9 +263,12 @@ def run_all(time_index, p15, p60, ev_scenarios, tank_scenarios, tank_params):
             if hourly and not check_hourly_constant(res["P"], time_index, tol=1e-4):
                 raise ValueError(f"Tank hourly constraint failed: {sc['scenario_id']}")
 
-        delta_eur, delta_pct = _compute_delta(res_60["cost"], res_15["cost"])
+        delta_eur, delta_pct = _compute_delta(
+            res_60["cost"], res_15["cost"], scenario_id=sc["scenario_id"]
+        )
         results.append(
             {
+                "method": "OPT",
                 "device": sc["device"],
                 "scenario_id": sc["scenario_id"],
                 "cost_15min": res_15["cost"],
@@ -296,6 +320,291 @@ def run_all(time_index, p15, p60, ev_scenarios, tank_scenarios, tank_params):
 
     if plot_data["tank"] is None and tank_fallback is not None:
         plot_data["tank"] = tank_fallback
+
+    return results, plot_data
+
+
+def run_baselines(time_index, p15, p60, ev_scenarios, tank_scenarios, tank_params):
+    results = []
+
+    for sc in ev_scenarios:
+        start_idx = sc["start_idx"]
+        end_idx = sc["end_idx"]
+        times = pd.DatetimeIndex(time_index[start_idx:end_idx])
+        prices_15 = p15[start_idx:end_idx]
+        prices_60 = p60[start_idx:end_idx]
+
+        ev_baselines = [
+            (
+                "BASE_CHARGE_NOW",
+                lambda prices: baseline_ev_charge_now(
+                    prices, DT_HOURS, sc["pmax"], sc["eta"], sc["e_need"]
+                ),
+            ),
+            (
+                "BASE_FIXED_00_06",
+                lambda prices: baseline_ev_fixed_window(
+                    prices,
+                    times,
+                    DT_HOURS,
+                    sc["pmax"],
+                    sc["eta"],
+                    sc["e_need"],
+                    start_h=0,
+                    end_h=6,
+                ),
+            ),
+        ]
+
+        for method, fn in ev_baselines:
+            res_15 = fn(prices_15)
+            res_60 = fn(prices_60)
+
+            for res in (res_15, res_60):
+                if res.get("status") != "simulated" or res.get("P") is None:
+                    continue
+                if not check_ev_energy(
+                    res["P"], DT_HOURS, sc["eta"], sc["e_need"], tol=1e-3
+                ):
+                    raise ValueError(f"EV baseline energy failed: {sc['scenario_id']} {method}")
+
+            delta_eur, delta_pct = _compute_delta(
+                res_60["cost"], res_15["cost"], scenario_id=f"{sc['scenario_id']}[{method}]"
+            )
+            results.append(
+                {
+                    "method": method,
+                    "device": sc["device"],
+                    "scenario_id": sc["scenario_id"],
+                    "home_window": sc.get("home_window", ""),
+                    "pmax": sc["pmax"],
+                    "e_need": sc["e_need"],
+                    "cost_15min": res_15["cost"],
+                    "cost_60min": res_60["cost"],
+                    "delta_eur": delta_eur,
+                    "delta_pct": delta_pct,
+                    "cost_ctrl_only": np.nan,
+                    "cost_price_only": np.nan,
+                    "status_15min": res_15.get("status", ""),
+                    "status_60min": res_60.get("status", ""),
+                    "status_ctrl_only": "",
+                    "status_price_only": "",
+                    "row_status": _row_status(res_15.get("status", ""), res_60.get("status", "")),
+                    "min_temp_15": np.nan,
+                    "min_temp_60": np.nan,
+                    "violations_15": np.nan,
+                    "violations_60": np.nan,
+                    "daily_hotwater_kwh": np.nan,
+                    "events": "",
+                }
+            )
+
+    qdraw_kw = None
+    for sc in tank_scenarios:
+        daily_kwh = sc.get("daily_hotwater_kwh")
+        if daily_kwh is not None and not np.isnan(daily_kwh):
+            validate_daily_draw(time_index, sc["draw_kwh"], daily_kwh, sc["scenario_id"])
+
+        draw_kwh = sc["draw_kwh"]
+        qdraw_kw = draw_kwh / DT_HOURS
+
+        tank_baselines = [
+            (
+                "BASE_THERMOSTAT",
+                lambda prices: baseline_tank_thermostat(
+                    prices,
+                    DT_HOURS,
+                    tank_params["pmax"],
+                    tank_params["eta"],
+                    tank_params["t0"],
+                    tank_params["tmin"],
+                    tank_params["tmax"],
+                    tank_params["tamb"],
+                    tank_params["c_kwh_per_c"],
+                    tank_params["k_loss"],
+                    qdraw_kw,
+                ),
+            ),
+            (
+                "BASE_NIGHT_00_06",
+                lambda prices: baseline_tank_night_only(
+                    prices,
+                    time_index,
+                    DT_HOURS,
+                    tank_params["pmax"],
+                    tank_params["eta"],
+                    tank_params["t0"],
+                    tank_params["tmin"],
+                    tank_params["tmax"],
+                    tank_params["tamb"],
+                    tank_params["c_kwh_per_c"],
+                    tank_params["k_loss"],
+                    qdraw_kw,
+                    start_h=0,
+                    end_h=6,
+                ),
+            ),
+        ]
+
+        for method, fn in tank_baselines:
+            res_15 = fn(p15)
+            res_60 = fn(p60)
+            delta_eur, delta_pct = _compute_delta(
+                res_60["cost"], res_15["cost"], scenario_id=f"{sc['scenario_id']}[{method}]"
+            )
+            results.append(
+                {
+                    "method": method,
+                    "device": sc["device"],
+                    "scenario_id": sc["scenario_id"],
+                    "cost_15min": res_15["cost"],
+                    "cost_60min": res_60["cost"],
+                    "delta_eur": delta_eur,
+                    "delta_pct": delta_pct,
+                    "cost_ctrl_only": np.nan,
+                    "cost_price_only": np.nan,
+                    "status_15min": res_15.get("status", ""),
+                    "status_60min": res_60.get("status", ""),
+                    "status_ctrl_only": "",
+                    "status_price_only": "",
+                    "row_status": _row_status(res_15.get("status", ""), res_60.get("status", "")),
+                    "min_temp_15": res_15.get("min_temp", np.nan),
+                    "min_temp_60": res_60.get("min_temp", np.nan),
+                    "violations_15": res_15.get("violations", np.nan),
+                    "violations_60": res_60.get("violations", np.nan),
+                    "daily_hotwater_kwh": sc.get("daily_hotwater_kwh", np.nan),
+                    "events": sc.get("events", ""),
+                }
+            )
+
+    return results
+
+
+def plot_tank_temp_soft(plot_data, out_dir, lambda_slack):
+    if plot_data is None:
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    times = pd.DatetimeIndex(plot_data["time"])
+    temp_times = times.append(pd.DatetimeIndex([times[-1] + pd.Timedelta(minutes=15)]))
+
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.plot(temp_times, plot_data["T_15"], label="softmin 15-min control")
+    ax.plot(temp_times, plot_data["T_60"], label="softmin 60-min control")
+    ax.set_ylabel("C")
+    ax.set_title(f"Tank soft Tmin (lambda={lambda_slack:g}) {plot_data['scenario_id']}")
+    ax.legend()
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "tank_temp_soft_15_vs_60.png"), dpi=150)
+    plt.close(fig)
+
+
+def run_soft_tank(time_index, p15, p60, tank_scenarios, tank_params, lambda_slack):
+    targets = {"TANK_family4_4showers", "TANK_family4_6showers"}
+    selected = [sc for sc in tank_scenarios if sc["scenario_id"] in targets]
+    if not selected:
+        selected = list(tank_scenarios)
+
+    results = []
+    plot_data = None
+    fallback_plot = None
+    for sc in selected:
+        daily_kwh = sc.get("daily_hotwater_kwh")
+        if daily_kwh is not None and not np.isnan(daily_kwh):
+            validate_daily_draw(time_index, sc["draw_kwh"], daily_kwh, sc["scenario_id"])
+
+        res_15 = optimize_tank_softmin(
+            p15,
+            time_index,
+            sc["draw_kwh"],
+            tank_params,
+            dt_hours=DT_HOURS,
+            hourly_control=False,
+            lambda_slack=lambda_slack,
+        )
+        res_60 = optimize_tank_softmin(
+            p60,
+            time_index,
+            sc["draw_kwh"],
+            tank_params,
+            dt_hours=DT_HOURS,
+            hourly_control=True,
+            lambda_slack=lambda_slack,
+        )
+
+        delta_soft_eur, delta_soft_pct = _compute_delta(
+            res_60["cost"], res_15["cost"], scenario_id=f"{sc['scenario_id']}[SOFT]"
+        )
+        results.append(
+            {
+                "method": "OPT_SOFTMIN",
+                "device": sc["device"],
+                "scenario_id": sc["scenario_id"],
+                "lambda_slack": lambda_slack,
+                "cost_15min_soft": res_15["cost"],
+                "cost_60min_soft": res_60["cost"],
+                "delta_soft": delta_soft_eur,
+                "delta_soft_pct": delta_soft_pct,
+                "slack_sum_15": res_15.get("slack_sum", np.nan),
+                "slack_max_15": res_15.get("slack_max", np.nan),
+                "min_temp_15": res_15.get("min_temp", np.nan),
+                "slack_sum_60": res_60.get("slack_sum", np.nan),
+                "slack_max_60": res_60.get("slack_max", np.nan),
+                "min_temp_60": res_60.get("min_temp", np.nan),
+                "status_15min": res_15.get("status", ""),
+                "status_60min": res_60.get("status", ""),
+                "row_status": _row_status(res_15.get("status", ""), res_60.get("status", "")),
+                "daily_hotwater_kwh": sc.get("daily_hotwater_kwh", np.nan),
+                "events": sc.get("events", ""),
+            }
+        )
+
+        if (
+            _is_feasible(res_15.get("status", ""))
+            and _is_feasible(res_60.get("status", ""))
+            and res_15.get("Temp") is not None
+            and res_60.get("Temp") is not None
+        ):
+            fallback_plot = {
+                "time": pd.DatetimeIndex(time_index),
+                "T_15": res_15["Temp"],
+                "T_60": res_60["Temp"],
+                "scenario_id": sc["scenario_id"],
+            }
+        if (
+            sc["scenario_id"] == "TANK_family4_6showers"
+            and _is_feasible(res_15.get("status", ""))
+            and _is_feasible(res_60.get("status", ""))
+            and res_15.get("Temp") is not None
+            and res_60.get("Temp") is not None
+        ):
+            plot_data = {
+                "time": pd.DatetimeIndex(time_index),
+                "T_15": res_15["Temp"],
+                "T_60": res_60["Temp"],
+                "scenario_id": sc["scenario_id"],
+            }
+
+        def _fmt(x, digits=2):
+            if x is None or not np.isfinite(x):
+                return "nan"
+            return f"{x:.{digits}f}"
+
+        print(
+            "SOFT TANK (lambda="
+            f"{lambda_slack:g}): {sc['scenario_id']} "
+            f"delta={_fmt(delta_soft_eur, 2)}EUR "
+            f"slack_sum_15={_fmt(res_15.get('slack_sum'), 4)} "
+            f"slack_max_15={_fmt(res_15.get('slack_max'), 3)} "
+            f"minT_15={_fmt(res_15.get('min_temp'), 2)}"
+        )
+
+    if plot_data is None and fallback_plot is not None:
+        plot_data = fallback_plot
 
     return results, plot_data
 
@@ -371,7 +680,12 @@ def plot_tank_temp(plot_data, out_dir):
 def print_top_deltas(results_df, top_n=5):
     if results_df.empty or "delta_eur" not in results_df.columns:
         return
-    df = results_df.dropna(subset=["delta_eur"]).copy()
+    df = results_df.copy()
+    if "method" in df.columns:
+        df = df[df["method"] == "OPT"]
+    if "row_status" in df.columns:
+        df = df[df["row_status"] == "ok"]
+    df = df.dropna(subset=["delta_eur"])
     if df.empty:
         return
     df["abs_delta"] = df["delta_eur"].abs()
@@ -388,6 +702,8 @@ def print_ev_aggregate_stats(results_df):
     if results_df.empty:
         return
     ev = results_df[results_df["device"] == "EV"].copy()
+    if "method" in ev.columns:
+        ev = ev[ev["method"] == "OPT"]
     if "row_status" in ev.columns:
         ev = ev[ev["row_status"] == "ok"]
     ev = ev.dropna(subset=["delta_eur"])
@@ -413,6 +729,8 @@ def main():
     parser = argparse.ArgumentParser(description="EV and tank optimization comparison")
     parser.add_argument("--input", required=True, help="Path to price CSV")
     parser.add_argument("--out", default="outputs", help="Output directory")
+    parser.add_argument("--run-soft-tank", action="store_true", help="Run soft Tmin tank report")
+    parser.add_argument("--lambda-slack", type=float, default=100.0, help="Slack penalty weight")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -437,19 +755,37 @@ def main():
 
     print_profile_summary(ev_scenarios, tank_scenarios)
 
-    results, plot_data = run_all(
+    results_opt, plot_data = run_all(
         time_index, p15, p60, ev_scenarios, tank_scenarios, tank_params
     )
-    results_df = pd.DataFrame(results)
-    results_path = os.path.join(args.out, "results_summary.csv")
-    results_df.to_csv(results_path, index=False)
+    results_base = run_baselines(time_index, p15, p60, ev_scenarios, tank_scenarios, tank_params)
+
+    results_opt_df = pd.DataFrame(results_opt)
+    results_base_df = pd.DataFrame(results_base)
+    results_df = pd.concat([results_opt_df, results_base_df], ignore_index=True, sort=False)
+    if not results_df.empty and {"method", "device", "scenario_id"}.issubset(results_df.columns):
+        results_df = results_df.sort_values(["method", "device", "scenario_id"]).reset_index(drop=True)
+
+    results_summary_path = os.path.join(args.out, "results_summary.csv")
+    results_df.to_csv(results_summary_path, index=False)
+    results_opt_df.to_csv(os.path.join(args.out, "results_opt.csv"), index=False)
+    results_base_df.to_csv(os.path.join(args.out, "results_baseline.csv"), index=False)
 
     plot_prices(time_index, p15, p60, args.out)
     plot_ev_power(plot_data["ev"], args.out)
     plot_tank_temp(plot_data["tank"], args.out)
 
-    print_top_deltas(results_df, top_n=5)
-    print_ev_aggregate_stats(results_df)
+    print_top_deltas(results_opt_df, top_n=5)
+    print_ev_aggregate_stats(results_opt_df)
+
+    if args.run_soft_tank:
+        soft_rows, soft_plot = run_soft_tank(
+            time_index, p15, p60, tank_scenarios, tank_params, args.lambda_slack
+        )
+        soft_df = pd.DataFrame(soft_rows)
+        soft_path = os.path.join(args.out, "results_tank_soft.csv")
+        soft_df.to_csv(soft_path, index=False)
+        plot_tank_temp_soft(soft_plot, args.out, args.lambda_slack)
 
 
 if __name__ == "__main__":
