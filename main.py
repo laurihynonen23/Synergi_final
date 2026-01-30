@@ -26,13 +26,13 @@ OPTIMAL_STATUSES = {"optimal", "optimal_inaccurate"}
 FEASIBLE_STATUSES = OPTIMAL_STATUSES | {"simulated"}
 
 
-def _compute_delta(cost_60, cost_15, scenario_id=""):
+def _compute_delta(cost_60, cost_15, scenario_id="", method="OPT"):
     if np.isnan(cost_60) or np.isnan(cost_15):
         return np.nan, np.nan
     delta = cost_60 - cost_15
     if np.isfinite(delta) and abs(delta) < EPS_EUR:
         return 0.0, 0.0
-    if np.isfinite(delta) and delta < -1e-4:
+    if np.isfinite(delta) and delta < -1e-4 and method == "OPT":
         print(f"Warning: unexpected negative delta {delta:.6f} for {scenario_id}")
     if abs(cost_60) < 1e-9:
         return delta, np.nan
@@ -154,7 +154,10 @@ def run_all(time_index, p15, p60, ev_scenarios, tank_scenarios, tank_params):
                 raise ValueError(f"EV hourly constraint failed: {sc['scenario_id']}")
 
         delta_eur, delta_pct = _compute_delta(
-            res_60["cost"], res_15["cost"], scenario_id=sc["scenario_id"]
+            res_60["cost"],
+            res_15["cost"],
+            scenario_id=sc["scenario_id"],
+            method="OPT",
         )
         results.append(
             {
@@ -264,7 +267,10 @@ def run_all(time_index, p15, p60, ev_scenarios, tank_scenarios, tank_params):
                 raise ValueError(f"Tank hourly constraint failed: {sc['scenario_id']}")
 
         delta_eur, delta_pct = _compute_delta(
-            res_60["cost"], res_15["cost"], scenario_id=sc["scenario_id"]
+            res_60["cost"],
+            res_15["cost"],
+            scenario_id=sc["scenario_id"],
+            method="OPT",
         )
         results.append(
             {
@@ -369,7 +375,10 @@ def run_baselines(time_index, p15, p60, ev_scenarios, tank_scenarios, tank_param
                     raise ValueError(f"EV baseline energy failed: {sc['scenario_id']} {method}")
 
             delta_eur, delta_pct = _compute_delta(
-                res_60["cost"], res_15["cost"], scenario_id=f"{sc['scenario_id']}[{method}]"
+                res_60["cost"],
+                res_15["cost"],
+                scenario_id=f"{sc['scenario_id']}[{method}]",
+                method=method,
             )
             results.append(
                 {
@@ -450,7 +459,10 @@ def run_baselines(time_index, p15, p60, ev_scenarios, tank_scenarios, tank_param
             res_15 = fn(p15)
             res_60 = fn(p60)
             delta_eur, delta_pct = _compute_delta(
-                res_60["cost"], res_15["cost"], scenario_id=f"{sc['scenario_id']}[{method}]"
+                res_60["cost"],
+                res_15["cost"],
+                scenario_id=f"{sc['scenario_id']}[{method}]",
+                method=method,
             )
             results.append(
                 {
@@ -537,7 +549,10 @@ def run_soft_tank(time_index, p15, p60, tank_scenarios, tank_params, lambda_slac
         )
 
         delta_soft_eur, delta_soft_pct = _compute_delta(
-            res_60["cost"], res_15["cost"], scenario_id=f"{sc['scenario_id']}[SOFT]"
+            res_60["cost"],
+            res_15["cost"],
+            scenario_id=f"{sc['scenario_id']}[SOFT]",
+            method="OPT",
         )
         results.append(
             {
@@ -607,6 +622,238 @@ def run_soft_tank(time_index, p15, p60, tank_scenarios, tank_params, lambda_slac
         plot_data = fallback_plot
 
     return results, plot_data
+
+
+def _sanitize_filename(name):
+    safe = []
+    for ch in str(name):
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe)
+
+
+def _hourly_max_diff(power_kw, time_index):
+    times = pd.DatetimeIndex(time_index)
+    hours = times.floor("h")
+    max_diff = 0.0
+    start = 0
+    n = len(power_kw)
+    while start < n:
+        hour = hours[start]
+        end = start + 1
+        while end < n and hours[end] == hour:
+            end += 1
+        block = power_kw[start:end]
+        if block.size > 0:
+            diff = float(np.max(block) - np.min(block))
+            if diff > max_diff:
+                max_diff = diff
+        start = end
+    return max_diff
+
+
+def _price_hour_check(time_index, p15, p60):
+    times = pd.DatetimeIndex(time_index)
+    hours = times.floor("h")
+    unique_hours = pd.Index(hours).unique()
+    if unique_hours.empty:
+        return None
+    target = None
+    preferred = pd.Timestamp("2025-10-07 00:00")
+    if preferred in unique_hours:
+        target = preferred
+    else:
+        target = unique_hours[0]
+    mask = hours == target
+    if np.sum(mask) != 4:
+        return {"hour": target, "p60": np.nan, "p15_mean": np.nan, "diff": np.nan, "pass": False}
+    p15_mean = float(np.mean(p15[mask]))
+    p60_val = float(np.mean(p60[mask]))
+    diff = abs(p60_val - p15_mean)
+    return {
+        "hour": target,
+        "p60": p60_val,
+        "p15_mean": p15_mean,
+        "diff": diff,
+        "pass": diff < 1e-9,
+    }
+
+
+def export_audit(
+    ev_scenario,
+    tank_scenario,
+    time_index,
+    p15,
+    p60,
+    tank_params,
+    audit_n,
+    out_dir,
+):
+    lines = []
+
+    if ev_scenario is not None:
+        start_idx = ev_scenario["start_idx"]
+        end_idx = ev_scenario["end_idx"]
+        times = pd.DatetimeIndex(time_index[start_idx:end_idx])
+        prices_15 = p15[start_idx:end_idx]
+        prices_60 = p60[start_idx:end_idx]
+
+        res_15 = optimize_ev(
+            prices_15,
+            times,
+            pmax=ev_scenario["pmax"],
+            eta=ev_scenario["eta"],
+            e_need=ev_scenario["e_need"],
+            dt_hours=DT_HOURS,
+            hourly_control=False,
+        )
+        res_60 = optimize_ev(
+            prices_60,
+            times,
+            pmax=ev_scenario["pmax"],
+            eta=ev_scenario["eta"],
+            e_need=ev_scenario["e_need"],
+            dt_hours=DT_HOURS,
+            hourly_control=True,
+        )
+        P_15 = res_15.get("P")
+        P_60 = res_60.get("P")
+
+        df_ev = pd.DataFrame(
+            {
+                "Time": times,
+                "price_15": prices_15,
+                "price_60": prices_60,
+                "P_15": P_15,
+                "P_60": P_60,
+                "E_15": P_15 * DT_HOURS if P_15 is not None else np.nan,
+                "E_60": P_60 * DT_HOURS if P_60 is not None else np.nan,
+            }
+        )
+        df_ev_out = df_ev.head(audit_n) if audit_n and audit_n > 0 else df_ev
+        ev_name = _sanitize_filename(ev_scenario["scenario_id"])
+        df_ev_out.to_csv(os.path.join(out_dir, f"audit_ev_{ev_name}.csv"), index=False)
+
+        e_grid = ev_scenario["e_need"] / ev_scenario["eta"]
+        e_del_15 = float(np.sum(P_15) * DT_HOURS) if P_15 is not None else np.nan
+        e_del_60 = float(np.sum(P_60) * DT_HOURS) if P_60 is not None else np.nan
+        ev_energy_pass = (
+            np.isfinite(e_del_15)
+            and np.isfinite(e_del_60)
+            and abs(e_del_15 - e_grid) < 1e-3
+            and abs(e_del_60 - e_grid) < 1e-3
+        )
+        lines.append(
+            f"EV Energy delivered: E_grid={e_grid:.6f} "
+            f"E15={e_del_15:.6f} E60={e_del_60:.6f} "
+            f"PASS={ev_energy_pass}"
+        )
+
+        if P_60 is not None:
+            max_diff = _hourly_max_diff(P_60, times)
+            lines.append(f"EV Hourly control max diff: {max_diff:.8f} PASS={max_diff < 1e-6}")
+        else:
+            lines.append("EV Hourly control max diff: n/a PASS=False")
+
+        if P_15 is not None:
+            cost15_re = float(np.sum(prices_15 * P_15) * DT_HOURS)
+            cost15_diff = abs(cost15_re - float(res_15.get("cost", np.nan)))
+        else:
+            cost15_re = np.nan
+            cost15_diff = np.nan
+        if P_60 is not None:
+            cost60_re = float(np.sum(prices_60 * P_60) * DT_HOURS)
+            cost60_diff = abs(cost60_re - float(res_60.get("cost", np.nan)))
+        else:
+            cost60_re = np.nan
+            cost60_diff = np.nan
+        lines.append(
+            f"EV Cost recompute: cost15={cost15_re:.6f} diff={cost15_diff:.8f} "
+            f"cost60={cost60_re:.6f} diff={cost60_diff:.8f} "
+            f"PASS={(cost15_diff < 1e-6) and (cost60_diff < 1e-6)}"
+        )
+    else:
+        lines.append("EV audit: not available")
+
+    if tank_scenario is not None:
+        times = pd.DatetimeIndex(time_index)
+        res_15 = optimize_tank(
+            p15,
+            time_index,
+            tank_scenario["draw_kwh"],
+            tank_params,
+            dt_hours=DT_HOURS,
+            hourly_control=False,
+        )
+        res_60 = optimize_tank(
+            p60,
+            time_index,
+            tank_scenario["draw_kwh"],
+            tank_params,
+            dt_hours=DT_HOURS,
+            hourly_control=True,
+        )
+        P_15 = res_15.get("P")
+        P_60 = res_60.get("P")
+        T_15 = res_15.get("T")
+        T_60 = res_60.get("T")
+        temp_15 = T_15[:-1] if T_15 is not None else None
+        temp_60 = T_60[:-1] if T_60 is not None else None
+
+        df_tank = pd.DataFrame(
+            {
+                "Time": times,
+                "price_15": p15,
+                "price_60": p60,
+                "draw_kwh": tank_scenario["draw_kwh"],
+                "P_15": P_15,
+                "P_60": P_60,
+                "Temp_15": temp_15,
+                "Temp_60": temp_60,
+            }
+        )
+        df_tank_out = df_tank.head(audit_n) if audit_n and audit_n > 0 else df_tank
+        tank_name = _sanitize_filename(tank_scenario["scenario_id"])
+        df_tank_out.to_csv(os.path.join(out_dir, f"audit_tank_{tank_name}.csv"), index=False)
+
+        if T_15 is not None:
+            min_temp = float(np.min(T_15))
+            max_temp = float(np.max(T_15))
+            temp_pass = (min_temp >= tank_params["tmin"] - 1e-3) and (
+                max_temp <= tank_params["tmax"] + 1e-3
+            )
+            lines.append(
+                f"Tank Temp bounds (15): min={min_temp:.3f} max={max_temp:.3f} PASS={temp_pass}"
+            )
+        else:
+            lines.append("Tank Temp bounds (15): n/a PASS=False")
+
+        if P_60 is not None:
+            max_diff = _hourly_max_diff(P_60, times)
+            lines.append(f"Tank Hourly control max diff: {max_diff:.8f} PASS={max_diff < 1e-6}")
+        else:
+            lines.append("Tank Hourly control max diff: n/a PASS=False")
+
+        draw_series = pd.Series(tank_scenario["draw_kwh"], index=times)
+        top_draws = draw_series.sort_values(ascending=False).head(10)
+        lines.append("Tank draw top-10 (time, kWh):")
+        for ts, val in top_draws.items():
+            lines.append(f"  {ts}: {val:.3f}")
+    else:
+        lines.append("Tank audit: not available")
+
+    price_check = _price_hour_check(time_index, p15, p60)
+    if price_check is not None:
+        lines.append(
+            f"Price hour check {price_check['hour']}: p60={price_check['p60']:.6f} "
+            f"mean_p15={price_check['p15_mean']:.6f} diff={price_check['diff']:.10f} "
+            f"PASS={price_check['pass']}"
+        )
+
+    with open(os.path.join(out_dir, "audit_checks.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def plot_prices(time_index, p15, p60, out_dir):
@@ -725,19 +972,60 @@ def print_ev_aggregate_stats(results_df):
         )
 
 
+def print_ev_monthly_totals(results_df):
+    if results_df.empty:
+        return
+    ev = results_df[results_df["device"] == "EV"].copy()
+    if "method" in ev.columns:
+        ev = ev[ev["method"] == "OPT"]
+    if "row_status" in ev.columns:
+        ev = ev[ev["row_status"] == "ok"]
+    ev = ev.dropna(subset=["cost_15min", "cost_60min", "delta_eur"])
+    if ev.empty:
+        return
+    print("EV monthly totals (OPT):")
+    grouped = ev.groupby(["pmax", "e_need"])
+    for (pmax, e_need), group in grouped:
+        sum_cost15 = float(group["cost_15min"].sum())
+        sum_cost60 = float(group["cost_60min"].sum())
+        sum_delta = float(group["delta_eur"].sum())
+        pct = (sum_delta / sum_cost60 * 100.0) if abs(sum_cost60) > 1e-12 else np.nan
+        print(
+            f"Pmax={pmax:g}, E={e_need:g}: "
+            f"cost15={sum_cost15:.2f}€, cost60={sum_cost60:.2f}€, "
+            f"delta={sum_delta:.2f}€ ({pct:.1f}%)"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="EV and tank optimization comparison")
     parser.add_argument("--input", required=True, help="Path to price CSV")
     parser.add_argument("--out", default="outputs", help="Output directory")
+    parser.add_argument("--expected-rows", type=int, default=None, help="Optional row count check")
     parser.add_argument("--run-soft-tank", action="store_true", help="Run soft Tmin tank report")
     parser.add_argument("--lambda-slack", type=float, default=100.0, help="Slack penalty weight")
+    parser.add_argument("--audit", action="store_true", help="Run audit export")
+    parser.add_argument("--audit-scenario", type=str, default="", help="Scenario id to audit")
+    parser.add_argument("--audit-n", type=int, default=96, help="Rows in audit CSV output")
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
 
-    df, p15 = read_prices(args.input)
+    df, p15 = read_prices(args.input, expected_rows=args.expected_rows)
     p60 = make_hourly_price_repeated(df)
     time_index = pd.DatetimeIndex(df["Time"])
+
+    n_rows = len(df)
+    start_ts = df["Time"].iloc[0]
+    end_ts = df["Time"].iloc[-1]
+    days = df["Time"].dt.normalize().nunique()
+    hours = n_rows / 4.0
+    print(
+        f"Loaded {n_rows} rows (15min). Range: {start_ts} -> {end_ts}. "
+        f"Days={days}, Hours={hours:.2f}."
+    )
+    if n_rows % 96 != 0:
+        print("Warning: rows not multiple of 96 (possible DST shift or missing data).")
 
     tank_params = {
         "pmax": 3.0,
@@ -777,6 +1065,7 @@ def main():
 
     print_top_deltas(results_opt_df, top_n=5)
     print_ev_aggregate_stats(results_opt_df)
+    print_ev_monthly_totals(results_opt_df)
 
     if args.run_soft_tank:
         soft_rows, soft_plot = run_soft_tank(
@@ -786,6 +1075,66 @@ def main():
         soft_path = os.path.join(args.out, "results_tank_soft.csv")
         soft_df.to_csv(soft_path, index=False)
         plot_tank_temp_soft(soft_plot, args.out, args.lambda_slack)
+
+    if args.audit:
+        ev_scenario = None
+        tank_scenario = None
+        if args.audit_scenario:
+            for sc in ev_scenarios:
+                if sc["scenario_id"] == args.audit_scenario:
+                    ev_scenario = sc
+                    break
+            for sc in tank_scenarios:
+                if sc["scenario_id"] == args.audit_scenario:
+                    tank_scenario = sc
+                    break
+            if ev_scenario is None and tank_scenario is None:
+                print(f"Audit scenario not found: {args.audit_scenario}")
+
+        if ev_scenario is None:
+            ev_candidates = results_opt_df[
+                (results_opt_df["device"] == "EV") & (results_opt_df["row_status"] == "ok")
+            ].dropna(subset=["delta_eur"])
+            if not ev_candidates.empty:
+                ev_id = ev_candidates.loc[ev_candidates["delta_eur"].abs().idxmax(), "scenario_id"]
+                ev_scenario = next(
+                    (sc for sc in ev_scenarios if sc["scenario_id"] == ev_id), None
+                )
+        if ev_scenario is None and ev_scenarios:
+            ev_scenario = ev_scenarios[0]
+
+        tank_scenario = tank_scenario
+        if tank_scenario is None:
+            preferred = next(
+                (sc for sc in tank_scenarios if sc["scenario_id"] == "TANK_family4_6showers"),
+                None,
+            )
+            if preferred is not None:
+                tank_scenario = preferred
+        if tank_scenario is None:
+            tank_candidates = results_opt_df[
+                (results_opt_df["device"] == "TANK") & (results_opt_df["row_status"] == "ok")
+            ].dropna(subset=["delta_eur"])
+            if not tank_candidates.empty:
+                tank_id = tank_candidates.loc[
+                    tank_candidates["delta_eur"].abs().idxmax(), "scenario_id"
+                ]
+                tank_scenario = next(
+                    (sc for sc in tank_scenarios if sc["scenario_id"] == tank_id), None
+                )
+        if tank_scenario is None and tank_scenarios:
+            tank_scenario = tank_scenarios[0]
+
+        export_audit(
+            ev_scenario,
+            tank_scenario,
+            time_index,
+            p15,
+            p60,
+            tank_params,
+            args.audit_n,
+            args.out,
+        )
 
 
 if __name__ == "__main__":

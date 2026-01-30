@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+outputs/
+Spot15min_January_Combined.csv

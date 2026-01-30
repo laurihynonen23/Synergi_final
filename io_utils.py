@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 
-def read_prices(path, expected_rows=768):
+def read_prices(path, expected_rows=None):
     df = pd.read_csv(path, sep=";", decimal=",")
     if "Time" not in df.columns:
         raise ValueError("Missing Time column")
@@ -20,7 +20,10 @@ def read_prices(path, expected_rows=768):
     if df["c_per_kwh"].isna().any():
         raise ValueError("Price column has NaN values")
     if df["Time"].duplicated().any():
-        raise ValueError("Time column has duplicate timestamps")
+        raise ValueError(
+            "Time column has duplicate timestamps (possible DST overlap). "
+            "Use UTC timestamps or a range without DST overlaps."
+        )
 
     if expected_rows is not None and len(df) != expected_rows:
         raise ValueError(f"Expected {expected_rows} rows, got {len(df)}")
@@ -29,7 +32,10 @@ def read_prices(path, expected_rows=768):
 
     diffs = df["Time"].diff().dropna()
     if not (diffs == pd.Timedelta(minutes=15)).all():
-        raise ValueError("Time steps are not consistently 15 minutes")
+        raise ValueError(
+            "Time steps are not consistently 15 minutes (possible DST shift or missing data). "
+            "Use UTC timestamps or a range without DST gaps/overlaps."
+        )
 
     df["eur_per_kwh"] = df["c_per_kwh"] / 100.0
     if df["eur_per_kwh"].isna().any():
