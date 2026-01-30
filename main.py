@@ -997,6 +997,181 @@ def print_ev_monthly_totals(results_df):
         )
 
 
+def _parse_ev_date(scenario_id):
+    if not isinstance(scenario_id, str):
+        return ""
+    if scenario_id.startswith("EV_"):
+        parts = scenario_id.split("_")
+        if len(parts) >= 2:
+            return parts[1]
+    return ""
+
+
+def write_human_summaries(results_opt_df, results_base_df, period_days, out_dir):
+    # EV monthly summary
+    ev = results_opt_df[(results_opt_df["device"] == "EV") & (results_opt_df["method"] == "OPT")].copy()
+    if not ev.empty:
+        grouped = ev.groupby(["pmax", "e_need"])
+        ev_sum = grouped.agg(
+            n_nights=("delta_eur", "count"),
+            total_cost_15_eur=("cost_15min", "sum"),
+            total_cost_60_eur=("cost_60min", "sum"),
+            total_delta_eur=("delta_eur", "sum"),
+            mean_delta_eur=("delta_eur", "mean"),
+            median_delta_eur=("delta_eur", "median"),
+            min_delta_eur=("delta_eur", "min"),
+            max_delta_eur=("delta_eur", "max"),
+        ).reset_index()
+        ev_sum["total_delta_pct"] = (
+            ev_sum["total_delta_eur"] / ev_sum["total_cost_60_eur"] * 100.0
+        )
+        ev_sum["avg_cost_15_eur_per_night"] = ev_sum["total_cost_15_eur"] / ev_sum["n_nights"]
+        ev_sum["avg_cost_60_eur_per_night"] = ev_sum["total_cost_60_eur"] / ev_sum["n_nights"]
+        ev_sum = ev_sum.sort_values(["pmax", "e_need"]).reset_index(drop=True)
+        ev_sum = ev_sum.round(
+            {
+                "total_cost_15_eur": 4,
+                "total_cost_60_eur": 4,
+                "total_delta_eur": 4,
+                "total_delta_pct": 2,
+                "mean_delta_eur": 4,
+                "median_delta_eur": 4,
+                "min_delta_eur": 4,
+                "max_delta_eur": 4,
+                "avg_cost_15_eur_per_night": 4,
+                "avg_cost_60_eur_per_night": 4,
+            }
+        )
+        ev_sum.to_csv(os.path.join(out_dir, "summary_ev_month.csv"), index=False)
+
+    # Tank period summary
+    tank = results_opt_df[(results_opt_df["device"] == "TANK") & (results_opt_df["method"] == "OPT")].copy()
+    if not tank.empty:
+        tank_group = tank.groupby(["scenario_id"])
+        tank_sum = tank_group.agg(
+            total_cost_15_eur=("cost_15min", "sum"),
+            total_cost_60_eur=("cost_60min", "sum"),
+            total_delta_eur=("delta_eur", "sum"),
+            min_temp_15=("min_temp_15", "min"),
+            min_temp_60=("min_temp_60", "min"),
+            violations_15=("violations_15", "max"),
+            violations_60=("violations_60", "max"),
+            daily_hotwater_kwh=("daily_hotwater_kwh", "first"),
+        ).reset_index()
+        tank_sum["period_days"] = period_days
+        tank_sum["total_delta_pct"] = (
+            tank_sum["total_delta_eur"] / tank_sum["total_cost_60_eur"] * 100.0
+        )
+        if period_days and period_days > 0:
+            tank_sum["delta_eur_per_day"] = tank_sum["total_delta_eur"] / period_days
+            tank_sum["cost_15_per_day"] = tank_sum["total_cost_15_eur"] / period_days
+            tank_sum["cost_60_per_day"] = tank_sum["total_cost_60_eur"] / period_days
+        tank_sum = tank_sum.sort_values("total_delta_eur", ascending=False).reset_index(drop=True)
+        tank_sum = tank_sum.round(
+            {
+                "total_cost_15_eur": 4,
+                "total_cost_60_eur": 4,
+                "total_delta_eur": 4,
+                "total_delta_pct": 2,
+                "delta_eur_per_day": 4,
+                "cost_15_per_day": 4,
+                "cost_60_per_day": 4,
+                "min_temp_15": 3,
+                "min_temp_60": 3,
+            }
+        )
+        tank_sum.to_csv(os.path.join(out_dir, "summary_tank_period.csv"), index=False)
+
+    # EV top-10 nights
+    if not ev.empty:
+        ev_top = ev.copy()
+        ev_top["date"] = ev_top["scenario_id"].apply(_parse_ev_date)
+        ev_top = ev_top.sort_values("delta_eur", ascending=False).head(10)
+        ev_top = ev_top[
+            [
+                "date",
+                "pmax",
+                "e_need",
+                "cost_15min",
+                "cost_60min",
+                "delta_eur",
+                "delta_pct",
+            ]
+        ]
+        ev_top = ev_top.round(
+            {"cost_15min": 4, "cost_60min": 4, "delta_eur": 4, "delta_pct": 2}
+        )
+        ev_top.to_csv(os.path.join(out_dir, "ev_top10_nights.csv"), index=False)
+
+    # Baseline summaries (separate)
+    if not results_base_df.empty:
+        base_ev = results_base_df[results_base_df["device"] == "EV"].copy()
+        if not base_ev.empty:
+            base_ev_group = base_ev.groupby(["method", "pmax", "e_need"])
+            base_ev_sum = base_ev_group.agg(
+                n_nights=("delta_eur", "count"),
+                total_cost_15_eur=("cost_15min", "sum"),
+                total_cost_60_eur=("cost_60min", "sum"),
+                settlement_delta_eur=("delta_eur", "sum"),
+                mean_cost_15_eur=("cost_15min", "mean"),
+                mean_cost_60_eur=("cost_60min", "mean"),
+            ).reset_index()
+            base_ev_sum["settlement_delta_pct"] = (
+                base_ev_sum["settlement_delta_eur"] / base_ev_sum["total_cost_60_eur"] * 100.0
+            )
+            base_ev_sum = base_ev_sum.sort_values(["method", "pmax", "e_need"]).reset_index(
+                drop=True
+            )
+            base_ev_sum = base_ev_sum.round(
+                {
+                    "total_cost_15_eur": 4,
+                    "total_cost_60_eur": 4,
+                    "settlement_delta_eur": 4,
+                    "settlement_delta_pct": 2,
+                    "mean_cost_15_eur": 4,
+                    "mean_cost_60_eur": 4,
+                }
+            )
+            base_ev_sum.to_csv(os.path.join(out_dir, "baseline_ev_summary.csv"), index=False)
+
+        base_tank = results_base_df[results_base_df["device"] == "TANK"].copy()
+        if not base_tank.empty:
+            base_tank_group = base_tank.groupby(["method", "scenario_id"])
+            base_tank_sum = base_tank_group.agg(
+                total_cost_15_eur=("cost_15min", "sum"),
+                total_cost_60_eur=("cost_60min", "sum"),
+                settlement_delta_eur=("delta_eur", "sum"),
+                mean_cost_15_eur=("cost_15min", "mean"),
+                mean_cost_60_eur=("cost_60min", "mean"),
+                min_temp_15=("min_temp_15", "min"),
+                min_temp_60=("min_temp_60", "min"),
+                violations_15=("violations_15", "max"),
+                violations_60=("violations_60", "max"),
+                daily_hotwater_kwh=("daily_hotwater_kwh", "first"),
+            ).reset_index()
+            base_tank_sum["settlement_delta_pct"] = (
+                base_tank_sum["settlement_delta_eur"] / base_tank_sum["total_cost_60_eur"] * 100.0
+            )
+            base_tank_sum = base_tank_sum.sort_values(["method", "scenario_id"]).reset_index(
+                drop=True
+            )
+            base_tank_sum = base_tank_sum.round(
+                {
+                    "total_cost_15_eur": 4,
+                    "total_cost_60_eur": 4,
+                    "settlement_delta_eur": 4,
+                    "settlement_delta_pct": 2,
+                    "mean_cost_15_eur": 4,
+                    "mean_cost_60_eur": 4,
+                    "min_temp_15": 3,
+                    "min_temp_60": 3,
+                }
+            )
+            base_tank_sum.to_csv(
+                os.path.join(out_dir, "baseline_tank_summary.csv"), index=False
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description="EV and tank optimization comparison")
     parser.add_argument("--input", required=True, help="Path to price CSV")
@@ -1066,6 +1241,7 @@ def main():
     print_top_deltas(results_opt_df, top_n=5)
     print_ev_aggregate_stats(results_opt_df)
     print_ev_monthly_totals(results_opt_df)
+    write_human_summaries(results_opt_df, results_base_df, days, args.out)
 
     if args.run_soft_tank:
         soft_rows, soft_plot = run_soft_tank(
